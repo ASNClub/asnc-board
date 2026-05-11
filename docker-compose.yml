@@ -1,0 +1,244 @@
+services:
+
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: honeygarden
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./platform/deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,z
+      - ./platform/deploy/postgres/rss_sources_seed.sql:/seeds/rss_sources_seed.sql:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: docker.io/library/nats:2.10-alpine
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir=/data"]
+    volumes:
+      - nats_data:/data
+
+  migrator:
+    image: migrate/migrate
+    volumes:
+      - ./apps/forum/migrations:/migrations:ro,z
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/honeygarden?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:stable
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:8081:8080"
+    command: 'start-from-init --masterkey "${ZITADEL_MASTERKEY}" --tlsMode external --config /zitadel-config.yaml'
+    volumes:
+      - ./platform/deploy/zitadel/config.yaml:/zitadel-config.yaml:ro
+    environment:
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: ${POSTGRES_USER}
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: ${POSTGRES_PASSWORD}
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: ${POSTGRES_USER}
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: ${POSTGRES_PASSWORD}
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_EXTERNALSECURE: "true"
+      ZITADEL_EXTERNALDOMAIN: ${ZITADEL_DOMAIN:-auth.honeygarden.space}
+      ZITADEL_EXTERNALPORT: ${ZITADEL_EXTERNALPORT:-443}
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: HoneyGarden
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_ADDRESS: admin@honeygarden.space
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_VERIFIED: "true"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: ${ZITADEL_ADMIN_PASS}
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  wakapi:
+    image: ghcr.io/muety/wakapi:latest
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:3002:3000"
+    environment:
+      WAKAPI_DB_TYPE: postgres
+      WAKAPI_DB_HOST: postgres
+      WAKAPI_DB_PORT: 5432
+      WAKAPI_DB_NAME: wakapi
+      WAKAPI_DB_USER: ${POSTGRES_USER}
+      WAKAPI_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      WAKAPI_PASSWORD_SALT: ${WAKAPI_PASSWORD_SALT}
+      WAKAPI_PUBLIC_URL: https://waka.honeygarden.space
+      WAKAPI_ALLOW_SIGNUP: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:3004:3001"
+    volumes:
+      - uptime_kuma_data:/app/data
+
+  meilisearch:
+    image: docker.io/getmeili/meilisearch:v1.12
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_API_KEY:?MEILISEARCH_API_KEY must be set}
+    volumes:
+      - meilisearch_data:/meili_data
+
+  minio:
+    image: docker.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "10.0.0.2:9000:9000"
+      - "10.0.0.2:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?S3_ACCESS_KEY must be set}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?S3_SECRET_KEY must be set}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  honeygarden:
+    build:
+      context: ./apps/forum/backend/honeygarden
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:8080:8080"
+    environment:
+      PORT: 8080
+      JWKS_URL: ${JWKS_URL}
+      JWKS_HOST: ${JWKS_HOST:-auth.honeygarden.space}
+      ADMIN_AUTH_IDS: ${ADMIN_AUTH_IDS:-}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/honeygarden
+      NATS_URL: nats://nats:4222
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILISEARCH_API_KEY:?MEILISEARCH_API_KEY must be set}
+      RSS_INTERVAL: ${RSS_INTERVAL:-30m}
+      RSS_TIMEOUT: ${RSS_TIMEOUT:-15s}
+      FRONTEND_URL: ${FRONTEND_URL:-https://honeygarden.space}
+      OAUTH_CALLBACK_BASE: ${OAUTH_CALLBACK_BASE:-https://honeygarden.space/api/v1}
+      OAUTH_STATE_KEY: ${OAUTH_STATE_KEY:?OAUTH_STATE_KEY must be set}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITLAB_CLIENT_ID: ${GITLAB_CLIENT_ID:-}
+      GITLAB_CLIENT_SECRET: ${GITLAB_CLIENT_SECRET:-}
+      GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.com}
+      CODEBERG_CLIENT_ID: ${CODEBERG_CLIENT_ID:-}
+      CODEBERG_CLIENT_SECRET: ${CODEBERG_CLIENT_SECRET:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
+      S3_BUCKET: ${S3_BUCKET:-uploads}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY must be set}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY must be set}
+      S3_USE_SSL: ${S3_USE_SSL:-false}
+      S3_PUBLIC_BASE: ${S3_PUBLIC_BASE:-/uploads}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+      meilisearch:
+        condition: service_started
+      zitadel:
+        condition: service_started
+      minio:
+        condition: service_healthy
+
+  forum-web:
+    build:
+      context: ./apps/forum/frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: https://honeygarden.space/api
+        VITE_ZITADEL_URL: https://${ZITADEL_DOMAIN:-auth.honeygarden.space}
+        VITE_ZITADEL_CLIENT_ID: ${VITE_ZITADEL_CLIENT_ID:-}
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:3001:3000"
+
+  alloy:
+    image: docker.io/grafana/alloy:latest
+    restart: unless-stopped
+    volumes:
+      - ./platform/deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro,z
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: run /etc/alloy/config.alloy
+    depends_on:
+      - loki
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.2.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./platform/deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
+      - prometheus_data:/prometheus
+
+  loki:
+    image: docker.io/grafana/loki:3.4.2
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+
+  tempo:
+    image: docker.io/grafana/tempo:2.7.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./platform/deploy/tempo/tempo.yaml:/etc/tempo.yaml:ro,z
+      - tempo_data:/var/tempo
+
+  grafana:
+    image: docker.io/grafana/grafana:11.5.2
+    restart: unless-stopped
+    ports:
+      - "10.0.0.2:3003:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./platform/deploy/grafana/provisioning:/etc/grafana/provisioning:ro,z
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+volumes:
+  postgres_data:
+  nats_data:
+  meilisearch_data:
+  minio_data:
+  uptime_kuma_data:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  grafana_data:

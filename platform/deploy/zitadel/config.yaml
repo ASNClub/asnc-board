@@ -1,0 +1,6 @@
+ExternalDomain: auth.honeygarden.space
+ExternalPort: 443
+ExternalSecure: true
+
+TLS:
+  Enabled: false

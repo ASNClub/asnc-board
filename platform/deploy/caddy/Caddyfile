@@ -1,0 +1,56 @@
+{
+	email {$ACME_EMAIL}
+}
+
+honeygarden.space {
+	# defence-in-depth: вырезаем identity-заголовки, которые мог прислать клиент,
+	# чтобы даже при ошибке в бэкенде нельзя было заспуфить X-Auth-ID.
+	request_header -X-Auth-ID
+	request_header -X-Auth-Username
+	request_header -X-Auth-Display-Name
+	request_header -X-Dev-Auth-ID
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	handle /api/* {
+		reverse_proxy 10.0.0.2:8080
+	}
+	handle /admin/* {
+		reverse_proxy 10.0.0.2:8080
+	}
+	handle /uploads/* {
+		header Content-Disposition "attachment"
+		reverse_proxy 10.0.0.2:9000 {
+			header_up Host {upstream_hostport}
+		}
+	}
+	handle {
+		reverse_proxy 10.0.0.2:3001
+	}
+}
+
+auth.honeygarden.space {
+	reverse_proxy 10.0.0.2:8081 {
+		transport http {
+			versions h2c
+		}
+	}
+}
+
+waka.honeygarden.space {
+	reverse_proxy 10.0.0.2:3002
+}
+
+grafana.honeygarden.space {
+	reverse_proxy 10.0.0.2:3003
+}
+
+status.honeygarden.space {
+	reverse_proxy 10.0.0.2:3004
+}
+
